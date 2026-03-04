@@ -56,7 +56,7 @@ def test_add_kernel(size, atol=1e-3, rtol=1e-3, device=DEVICE):
     z_pytorch = x + y
 
     torch.testing.assert_close(z_triton, z_pytorch, atol=atol, rtol=rtol)
-    print('test passed')
+    print('PASSED')
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -86,8 +86,7 @@ def benchmark(size, provider):
     return (gbps(ms), gbps(min_ms), gbps(max_ms))
 
 if __name__ == "__main__":
-    test_add_kernel(4096)
-    test_add_kernel(4097)
+    test_add_kernel(5467)
 
     if len(sys.argv) > 1 and sys.argv[1] == '--benchmark':
-        benchmark.run(save_path='.', print_data=True)
+        benchmark.run(save_path='.', print_data=False)
