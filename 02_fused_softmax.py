@@ -15,7 +15,8 @@ target = triton.runtime.driver.active.get_current_target()
 kernels = {}
 
 '''
-some visualisation
+some visualisation:
+in cuda(grid -> blocks -> threads)
 
         GPU
 +-------------------+
@@ -29,6 +30,28 @@ some visualisation
 | block block block |
 +-------------------+
 
+in triton:
+grid -> programs
+        GPU
++-------------------+
+| SM 0              |
+| pid0 pid1         |
++-------------------+
+| SM 1              |
+| pid2 pid3         |
++-------------------+
+| SM 2              |
+| pid4 pid5         |
++-------------------+
+
+each pid is one program instance
+based on pid get the offsets of elements that needs to processed
+
+blockIdx.x
+threadIdx.x
+
+program_id(0)
+tl.arange(...)
 '''
 
 def naive_softmax(x):
