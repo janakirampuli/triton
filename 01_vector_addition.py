@@ -55,6 +55,7 @@ def test_add_kernel(size, atol=1e-3, rtol=1e-3, device=DEVICE):
     z_triton = add(x, y)
     z_pytorch = x + y
 
+    # |a - b| ≤ atol + rtol * |b|
     torch.testing.assert_close(z_triton, z_pytorch, atol=atol, rtol=rtol)
     print('PASSED')
 

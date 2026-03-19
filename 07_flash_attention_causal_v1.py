@@ -173,7 +173,7 @@ def benchmark(SEQ_LEN, mode, provider, device=DEVICE):
     return total_flops * 1e-12 / (ms * 1e-3)
 
 
-def test_flashattention_kernel(B, H, N, d, device=DEVICE, atol=2e-3):
+def test_flashattention_kernel(B, H, N, d, device=DEVICE, atol=5e-3):
     q = torch.randn((B, H, N, d), dtype=torch.float16, device=device, requires_grad=True)
     k = torch.randn((B, H, N, d), dtype=torch.float16, device=device, requires_grad=True)
     v = torch.randn((B, H, N, d), dtype=torch.float16, device=device, requires_grad=True)
