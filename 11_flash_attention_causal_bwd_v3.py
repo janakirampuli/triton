@@ -25,7 +25,7 @@ let's take d = 128 => 512 * B_M + 512 * B_N * S <= 102400
     key=["N"]
 )
 @triton.jit
-def flash_attn_v2_fwd_kernel(
+def flash_attn_v3_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, scale,
     O_ptr,
     stride_Q_B, stride_Q_H, stride_Q_N, stride_Q_d,
@@ -60,14 +60,30 @@ def flash_attn_v2_fwd_kernel(
     O_offsets = offsets_QO_M[:, None] * stride_O_N + offsets_d[None, :] * stride_O_d
 
     mask_QO = (offsets_QO_M[:, None] < N) & (offsets_d[None, :] < d)
+    is_full_q_block = (index_Q + 1) * BLOCK_SIZE_M <= N
 
     M = tl.full([BLOCK_SIZE_M], value=float("-inf"), dtype=tl.float32)
     L = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32)
     O = tl.zeros([BLOCK_SIZE_M, d], dtype=tl.float32)
 
-    Q = tl.load(Q_ptr + Q_offsets, mask=mask_QO, other = 0.0)
+    # Fast path for full Q blocks: avoid masked load/store overhead.
+    if is_full_q_block:
+        Q = tl.load(Q_ptr + Q_offsets)
+    else:
+        Q = tl.load(Q_ptr + Q_offsets, mask=mask_QO, other=0.0)
+
+    # Use base-2 exponentials in the online softmax path.
+    # LOG2E = log_2(e)
+    # e^x = 2^(log_2(e^x))
+    # e^x = 2^(x * log_2(e))
+    # e^x = 2^(x * LOG2E)
+    # scale x and take 2^ instead of e^
+
+    LOG2E = 1.4426950408889634
+    qk_scale = scale * LOG2E
 
     num_steps = tl.cdiv(N, BLOCK_SIZE_N)
+    num_k_full_blocks = N // BLOCK_SIZE_N
 
     # causal split: full KV blocks (no causal mask) + boundary blocks (causal mask)
     if IS_CAUSAL:
@@ -78,30 +94,26 @@ def flash_attn_v2_fwd_kernel(
     else:
         num_full_steps = num_steps
 
-    # Stage 1: full blocks, no causal mask
-    for start in range(0, num_full_steps):
+    # Stage 1a: full-KV blocks, no causal mask, no boundary mask needed
+    stage1_full_end = tl.minimum(num_full_steps, num_k_full_blocks)
+    for start in range(0, stage1_full_end):
         offsets_KV_N = start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
         K_offsets = offsets_KV_N[:, None] * stride_K_N + offsets_d[None, :] * stride_K_d
         V_offsets = offsets_KV_N[:, None] * stride_V_N + offsets_d[None, :] * stride_V_d
 
-        mask_KV = (offsets_KV_N[:, None] < N) & (offsets_d[None, :] < d)
+        K = tl.load(K_ptr + K_offsets)
+        V = tl.load(V_ptr + V_offsets)
 
-        K = tl.load(K_ptr + K_offsets, mask=mask_KV, other=0.0)
-        V = tl.load(V_ptr + V_offsets, mask=mask_KV, other=0.0)
-
-        QKT = tl.dot(Q, tl.trans(K)) * scale
-
-        # boundary masking
-        QKT = tl.where(offsets_KV_N[None, :] < N, QKT, float("-inf"))
+        QKT = tl.dot(Q, tl.trans(K)) * qk_scale
 
         M_new = tl.max(QKT, axis=1)
         M_new = tl.maximum(M, M_new)
 
-        P = tl.exp(QKT - M_new[:, None])
+        P = tl.exp2(QKT - M_new[:, None])
         L_new = tl.sum(P, axis=1)
 
-        alpha = tl.exp(M - M_new)
+        alpha = tl.exp2(M - M_new)
         L_new = alpha * L + L_new
 
         O = O * alpha[:, None]
@@ -110,31 +122,86 @@ def flash_attn_v2_fwd_kernel(
         M = M_new
         L = L_new
 
-    # Stage 2: causal-masked blocks (contains diagonal/tail)
-    for start in range(num_full_steps, num_steps):
+    # Stage 1b: tail-KV block (if any), no causal mask, boundary mask required
+    for start in range(stage1_full_end, num_full_steps):
         offsets_KV_N = start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
         K_offsets = offsets_KV_N[:, None] * stride_K_N + offsets_d[None, :] * stride_K_d
         V_offsets = offsets_KV_N[:, None] * stride_V_N + offsets_d[None, :] * stride_V_d
 
-        mask_KV = (offsets_KV_N[:, None] < N) & (offsets_d[None, :] < d)
-
+        mask_KV = offsets_KV_N[:, None] < N
         K = tl.load(K_ptr + K_offsets, mask=mask_KV, other=0.0)
         V = tl.load(V_ptr + V_offsets, mask=mask_KV, other=0.0)
 
-        QKT = tl.dot(Q, tl.trans(K)) * scale
+        QKT = tl.dot(Q, tl.trans(K)) * qk_scale
+        QKT = tl.where(offsets_KV_N[None, :] < N, QKT, float("-inf"))
 
-        # boundary masking
+        M_new = tl.max(QKT, axis=1)
+        M_new = tl.maximum(M, M_new)
+
+        P = tl.exp2(QKT - M_new[:, None])
+        L_new = tl.sum(P, axis=1)
+
+        alpha = tl.exp2(M - M_new)
+        L_new = alpha * L + L_new
+
+        O = O * alpha[:, None]
+        O = O + tl.dot(P.to(V.dtype), V)
+
+        M = M_new
+        L = L_new
+
+    # Stage 2a: full-KV blocks with causal masking (no boundary mask)
+    stage2_full_end = tl.minimum(num_steps, num_k_full_blocks)
+    for start in range(num_full_steps, stage2_full_end):
+        offsets_KV_N = start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+        K_offsets = offsets_KV_N[:, None] * stride_K_N + offsets_d[None, :] * stride_K_d
+        V_offsets = offsets_KV_N[:, None] * stride_V_N + offsets_d[None, :] * stride_V_d
+
+        K = tl.load(K_ptr + K_offsets)
+        V = tl.load(V_ptr + V_offsets)
+
+        QKT = tl.dot(Q, tl.trans(K)) * qk_scale
+        QKT = tl.where(offsets_QO_M[:, None] >= offsets_KV_N[None, :], QKT, float("-inf"))
+
+        M_new = tl.max(QKT, axis=1)
+        M_new = tl.maximum(M, M_new)
+
+        P = tl.exp2(QKT - M_new[:, None])
+        L_new = tl.sum(P, axis=1)
+
+        alpha = tl.exp2(M - M_new)
+        L_new = alpha * L + L_new
+
+        O = O * alpha[:, None]
+        O = O + tl.dot(P.to(V.dtype), V)
+
+        M = M_new
+        L = L_new
+
+    # Stage 2b: tail-KV block with causal + boundary mask
+    for start in range(stage2_full_end, num_steps):
+        offsets_KV_N = start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+        K_offsets = offsets_KV_N[:, None] * stride_K_N + offsets_d[None, :] * stride_K_d
+        V_offsets = offsets_KV_N[:, None] * stride_V_N + offsets_d[None, :] * stride_V_d
+
+        mask_KV = offsets_KV_N[:, None] < N
+        K = tl.load(K_ptr + K_offsets, mask=mask_KV, other=0.0)
+        V = tl.load(V_ptr + V_offsets, mask=mask_KV, other=0.0)
+
+        QKT = tl.dot(Q, tl.trans(K)) * qk_scale
         QKT = tl.where(offsets_KV_N[None, :] < N, QKT, float("-inf"))
         QKT = tl.where(offsets_QO_M[:, None] >= offsets_KV_N[None, :], QKT, float("-inf"))
 
         M_new = tl.max(QKT, axis=1)
         M_new = tl.maximum(M, M_new)
 
-        P = tl.exp(QKT - M_new[:, None])
+        P = tl.exp2(QKT - M_new[:, None])
         L_new = tl.sum(P, axis=1)
 
-        alpha = tl.exp(M - M_new)
+        alpha = tl.exp2(M - M_new)
         L_new = alpha * L + L_new
 
         O = O * alpha[:, None]
@@ -143,12 +210,18 @@ def flash_attn_v2_fwd_kernel(
         M = M_new
         L = L_new
     O = O / L[:, None]
-    tl.store(O_ptr + O_offsets, O.to(O_ptr.dtype.element_ty), mask=mask_QO)
+    if is_full_q_block:
+        tl.store(O_ptr + O_offsets, O.to(O_ptr.dtype.element_ty))
+    else:
+        tl.store(O_ptr + O_offsets, O.to(O_ptr.dtype.element_ty), mask=mask_QO)
 
-    # store LSE = M + log(L)
+    # Store LSE in log2 so backward can directly use exp2.
     LSE_ptr += index_B * stride_LSE_B + index_H * stride_LSE_H
-    LSE = M + tl.log(L)
-    tl.store(LSE_ptr + offsets_QO_M * stride_LSE_N, LSE, mask=offsets_QO_M < N)
+    LSE = M + tl.log2(L)
+    if is_full_q_block:
+        tl.store(LSE_ptr + offsets_QO_M * stride_LSE_N, LSE)
+    else:
+        tl.store(LSE_ptr + offsets_QO_M * stride_LSE_N, LSE, mask=offsets_QO_M < N)
 
 
 @triton.autotune(
@@ -158,16 +231,14 @@ def flash_attn_v2_fwd_kernel(
         triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 32}, num_stages=4, num_warps=4),
     ],
     key=["N"],
-    # Backward uses atomic adds for dQ. During autotune, Triton runs multiple
-    # candidate configs on the same buffers, so we must reset outputs between
-    # trials to avoid accumulating gradients across benchmark runs. 
-    #                                                       -- gpt-5.3-codex
-    reset_to_zero=["dQ_ptr", "dK_ptr", "dV_ptr"]
+    # This kernel computes only dK/dV (no atomics), but still accumulates
+    # within-kernel across q-blocks. During autotune we must clear outputs.
+    reset_to_zero=["dK_ptr", "dV_ptr"]
 )
 @triton.jit
-def flash_attn_v2_bwd_kernel(
+def flash_attn_v3_bwd_dkdv_kernel(
     Q_ptr, K_ptr, V_ptr, scale,
-    O_ptr, dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
+    dO_ptr, dK_ptr, dV_ptr,
     LSE_ptr, D_ptr,
     stride_Q_B, stride_Q_H, stride_Q_N, stride_Q_d,
     stride_K_B, stride_K_H, stride_K_N, stride_K_d,
@@ -189,15 +260,16 @@ def flash_attn_v2_bwd_kernel(
     K_ptr += index_B * stride_K_B + index_H * stride_K_H
     V_ptr += index_B * stride_V_B + index_H * stride_V_H
 
-    dQ_ptr += index_B * stride_Q_B + index_H * stride_Q_H
     dK_ptr += index_B * stride_K_B + index_H * stride_K_H
     dV_ptr += index_B * stride_V_B + index_H * stride_V_H
 
-    O_ptr += index_B * stride_O_B + index_H * stride_O_H
     dO_ptr += index_B * stride_O_B + index_H * stride_O_H
 
     LSE_ptr += index_B * stride_LSE_B + index_H * stride_LSE_H
     D_ptr += index_B * stride_D_B + index_H * stride_D_H 
+
+    LOG2E = 1.4426950408889634
+    qk_scale = scale * LOG2E
 
     offsets_d = tl.arange(0, d)
     offsets_K = index_K * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -244,25 +316,20 @@ def flash_attn_v2_bwd_kernel(
         LSE = tl.load(LSE_ptr + offsets_Q * stride_LSE_N, mask=mask_Q, other=0.0)
         D = tl.load(D_ptr + offsets_Q * stride_D_N, mask=mask_Q, other=0.0)
 
-        S = tl.dot(Q, tl.trans(K)) * scale
+        S = tl.dot(Q, tl.trans(K)) * qk_scale
 
         valid_mask = (mask_Q[:, None] & mask_K[None, :]) & (offsets_Q[:, None] >= offsets_K[None, :])
 
         S = tl.where(valid_mask, S, float("-inf"))
 
-        # reconstruct P using LSE: P = exp(S - LSE)
-        P = tl.exp(S - LSE[:, None])
+        # LSE is stored in log2 from forward
+        P = tl.exp2(S - LSE[:, None])
 
         # dV += P^T @ DO
         dV += tl.dot(tl.trans(P).to(V.dtype), dO)
         # dS = P * (dP - D)
         # => dS = P * (dO @ V^T - D)
         dS = P * (tl.dot(dO, tl.trans(V)) - D[:, None])
-
-        # dQ += dS @ K * scale
-        dQ_block = tl.dot(dS.to(K.dtype), K) * scale
-
-        tl.atomic_add(dQ_ptr + Q_offsets, dQ_block.to(tl.float32), mask=mask_QO)
 
         # dK += dS^T @ Q * scale
         dK += tl.dot(tl.trans(dS).to(Q.dtype), Q) * scale
@@ -282,24 +349,18 @@ def flash_attn_v2_bwd_kernel(
         LSE = tl.load(LSE_ptr + offsets_Q * stride_LSE_N, mask=mask_Q, other=0.0)
         D = tl.load(D_ptr + offsets_Q * stride_D_N, mask=mask_Q, other=0.0)
 
-        S = tl.dot(Q, tl.trans(K)) * scale
+        S = tl.dot(Q, tl.trans(K)) * qk_scale
 
         valid_mask = mask_Q[:, None] & mask_K[None, :]
         S = tl.where(valid_mask, S, float("-inf"))
 
-        # reconstruct P using LSE: P = exp(S - LSE)
-        P = tl.exp(S - LSE[:, None])
+        P = tl.exp2(S - LSE[:, None])
 
         # dV += P^T @ DO
         dV += tl.dot(tl.trans(P).to(V.dtype), dO)
         # dS = P * (dP - D)
         # => dS = P * (dO @ V^T - D)
         dS = P * (tl.dot(dO, tl.trans(V)) - D[:, None])
-
-        # dQ += dS @ K * scale
-        dQ_block = tl.dot(dS.to(K.dtype), K) * scale
-
-        tl.atomic_add(dQ_ptr + Q_offsets, dQ_block.to(tl.float32), mask=mask_QO)
 
         # dK += dS^T @ Q * scale
         dK += tl.dot(tl.trans(dS).to(Q.dtype), Q) * scale
@@ -308,7 +369,121 @@ def flash_attn_v2_bwd_kernel(
     tl.store(dV_ptr + V_offsets, dV.to(dV_ptr.dtype.element_ty), mask=mask_KV)
 
 
-class flashattention_v2(torch.autograd.Function):
+@triton.autotune(
+    [
+        triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 32}, num_stages=5, num_warps=4),
+    ],
+    key=["N"]
+)
+@triton.jit
+def flash_attn_v3_bwd_dq_kernel(
+    Q_ptr, K_ptr, V_ptr, scale,
+    dO_ptr, dQ_ptr,
+    LSE_ptr, D_ptr,
+    stride_Q_B, stride_Q_H, stride_Q_N, stride_Q_d,
+    stride_K_B, stride_K_H, stride_K_N, stride_K_d,
+    stride_V_B, stride_V_H, stride_V_N, stride_V_d,
+    stride_O_B, stride_O_H, stride_O_N, stride_O_d,
+    stride_LSE_B, stride_LSE_H, stride_LSE_N,
+    stride_D_B, stride_D_H, stride_D_N,
+    N,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    d: tl.constexpr,
+    IS_CAUSAL: tl.constexpr
+):
+    index_B = tl.program_id(axis=0)
+    index_H = tl.program_id(axis=1)
+    index_Q = tl.program_id(axis=2)
+
+    Q_ptr += index_B * stride_Q_B + index_H * stride_Q_H
+    K_ptr += index_B * stride_K_B + index_H * stride_K_H
+    V_ptr += index_B * stride_V_B + index_H * stride_V_H
+
+    dQ_ptr += index_B * stride_Q_B + index_H * stride_Q_H
+    dO_ptr += index_B * stride_O_B + index_H * stride_O_H
+
+    LSE_ptr += index_B * stride_LSE_B + index_H * stride_LSE_H
+    D_ptr += index_B * stride_D_B + index_H * stride_D_H
+
+    LOG2E = 1.4426950408889634
+    qk_scale = scale * LOG2E
+
+    offsets_d = tl.arange(0, d)
+    offsets_Q = index_Q * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+
+    mask_Q = offsets_Q < N
+    mask_QO = mask_Q[:, None] & (offsets_d[None, :] < d)
+
+    Q_offsets = offsets_Q[:, None] * stride_Q_N + offsets_d[None, :] * stride_Q_d
+    O_offsets = offsets_Q[:, None] * stride_O_N + offsets_d[None, :] * stride_O_d
+
+    Q = tl.load(Q_ptr + Q_offsets, mask=mask_QO, other=0.0)
+    dO = tl.load(dO_ptr + O_offsets, mask=mask_QO, other=0.0)
+
+    LSE = tl.load(LSE_ptr + offsets_Q * stride_LSE_N, mask=mask_Q, other=0.0)
+    D = tl.load(D_ptr + offsets_Q * stride_D_N, mask=mask_Q, other=0.0)
+
+    dQ = tl.zeros([BLOCK_SIZE_M, d], dtype=tl.float32)
+
+    num_k_steps = tl.cdiv(N, BLOCK_SIZE_N)
+
+    # causal split for dQ:
+    # Stage 1: full KV blocks without causal mask
+    # Stage 2: boundary KV blocks with causal mask
+    if IS_CAUSAL:
+        causal_steps = tl.cdiv((index_Q + 1) * BLOCK_SIZE_M, BLOCK_SIZE_N)
+        num_k_steps = tl.minimum(causal_steps, num_k_steps)
+        num_full_steps = (index_Q * BLOCK_SIZE_M) // BLOCK_SIZE_N
+        num_full_steps = tl.minimum(num_full_steps, num_k_steps)
+    else:
+        num_full_steps = num_k_steps
+
+    for start in range(0, num_full_steps):
+        offsets_K = start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        mask_K = offsets_K < N
+        mask_KV = mask_K[:, None] & (offsets_d[None, :] < d)
+
+        K_offsets = offsets_K[:, None] * stride_K_N + offsets_d[None, :] * stride_K_d
+        V_offsets = offsets_K[:, None] * stride_V_N + offsets_d[None, :] * stride_V_d
+
+        K = tl.load(K_ptr + K_offsets, mask=mask_KV, other=0.0)
+        V = tl.load(V_ptr + V_offsets, mask=mask_KV, other=0.0)
+
+        S = tl.dot(Q, tl.trans(K)) * qk_scale
+        valid_mask = mask_Q[:, None] & mask_K[None, :]
+        S = tl.where(valid_mask, S, float("-inf"))
+
+        P = tl.exp2(S - LSE[:, None])
+        dS = P * (tl.dot(dO, tl.trans(V)) - D[:, None])
+        dQ += tl.dot(dS.to(K.dtype), K) * scale
+
+    for start in range(num_full_steps, num_k_steps):
+        offsets_K = start * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        mask_K = offsets_K < N
+        mask_KV = mask_K[:, None] & (offsets_d[None, :] < d)
+
+        K_offsets = offsets_K[:, None] * stride_K_N + offsets_d[None, :] * stride_K_d
+        V_offsets = offsets_K[:, None] * stride_V_N + offsets_d[None, :] * stride_V_d
+
+        K = tl.load(K_ptr + K_offsets, mask=mask_KV, other=0.0)
+        V = tl.load(V_ptr + V_offsets, mask=mask_KV, other=0.0)
+
+        S = tl.dot(Q, tl.trans(K)) * qk_scale
+        valid_mask = (mask_Q[:, None] & mask_K[None, :]) & (offsets_Q[:, None] >= offsets_K[None, :])
+        S = tl.where(valid_mask, S, float("-inf"))
+
+        P = tl.exp2(S - LSE[:, None])
+        dS = P * (tl.dot(dO, tl.trans(V)) - D[:, None])
+        dQ += tl.dot(dS.to(K.dtype), K) * scale
+
+    tl.store(dQ_ptr + Q_offsets, dQ.to(dQ_ptr.dtype.element_ty), mask=mask_QO)
+
+
+class flashattention_v3(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, scale, is_causal=False):
         # batch_size, n_heads, seq_len, head_dim
@@ -323,7 +498,7 @@ class flashattention_v2(torch.autograd.Function):
             triton.cdiv(N, args["BLOCK_SIZE_M"]),
         )
 
-        flash_attn_v2_fwd_kernel[grid](
+        flash_attn_v3_fwd_kernel[grid](
             q, k, v, scale,
             O,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -356,15 +531,34 @@ class flashattention_v2(torch.autograd.Function):
 
         D = (dO.float() * O.float()).sum(dim=-1)
 
-        grid = lambda args: (
+        grid_dkdv = lambda args: (
             B,
             H,
             triton.cdiv(N, args["BLOCK_SIZE_N"])
         )
 
-        flash_attn_v2_bwd_kernel[grid](
+        flash_attn_v3_bwd_dkdv_kernel[grid_dkdv](
             q, k, v, scale,
-            O, dO, dQ, dK, dV,
+            dO, dK, dV,
+            LSE, D,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            O.stride(0), O.stride(1), O.stride(2), O.stride(3),
+            LSE.stride(0), LSE.stride(1), LSE.stride(2),
+            D.stride(0), D.stride(1), D.stride(2),
+            N, d=d, IS_CAUSAL=is_causal
+        )
+
+        grid_dq = lambda args: (
+            B,
+            H,
+            triton.cdiv(N, args["BLOCK_SIZE_M"])
+        )
+
+        flash_attn_v3_bwd_dq_kernel[grid_dq](
+            q, k, v, scale,
+            dO, dQ,
             LSE, D,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
@@ -378,7 +572,7 @@ class flashattention_v2(torch.autograd.Function):
         return dQ.to(q.dtype), dK.to(k.dtype), dV.to(v.dtype), None, None
 
 
-triton_attention_v2 = flashattention_v2.apply
+triton_attention_v3 = flashattention_v3.apply
 
 configs = []
 for mode in ["fwd", "bwd", "fwd_bwd"]:
@@ -390,11 +584,11 @@ for mode in ["fwd", "bwd", "fwd_bwd"]:
             line_vals=["torch", "triton"],
             line_names=[
                 "torch.attn",
-                "triton.attn_v2"
+                "triton.attn_v3"
             ],
             styles=[("red", "-"), ("blue", "-")],
             ylabel="TFLOPS",
-            plot_name=f"causal-attention-v2-{mode}",
+            plot_name=f"causal-attention-v3-{mode}",
             args={"mode": mode}
         )
     )
@@ -410,7 +604,7 @@ def benchmark(SEQ_LEN, mode, provider, device=DEVICE):
     if provider == "torch":
         fwd_fn = lambda: torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
     if provider == "triton":
-        fwd_fn = lambda: triton_attention_v2(q, k, v, sm_scale, True)
+        fwd_fn = lambda: triton_attention_v3(q, k, v, sm_scale, True)
 
     out = fwd_fn()
     dO = torch.randn_like(out)
@@ -444,7 +638,7 @@ def test_flashattention_kernel(B, H, N, d, device=DEVICE, atol=5e-3):
     v = torch.randn((B, H, N, d), dtype=torch.float16, device=device, requires_grad=True)
     scale = 1 / math.sqrt(d)
 
-    tri_attn = triton_attention_v2(q, k, v, scale, True)
+    tri_attn = triton_attention_v3(q, k, v, scale, True)
 
     q_ref = q.clone().detach().requires_grad_(True)
     k_ref = k.clone().detach().requires_grad_(True)
